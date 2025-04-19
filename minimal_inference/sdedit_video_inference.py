@@ -52,7 +52,7 @@ def add_noise(pipeline, video, t):
     return noisy_video
 
 class SdeditVideoInference(InferencePipeline):
-    def inference(self, noise: torch.Tensor, text_prompts: List[str], start_latents: Optional[torch.Tensor] = None, return_latents: bool = False, denoise_steps_list: Optional[List[int]] = None) -> torch.Tensor:
+    def inference(self, noise: torch.Tensor, text_prompts: List[str], start_latents: Optional[torch.Tensor] = None, return_latents: bool = False, denoise_steps_list: Optional[List[int]] = None, force_latents: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
         Inputs:
@@ -129,7 +129,6 @@ class SdeditVideoInference(InferencePipeline):
                 # set current timestep
                 timestep = torch.ones(
                     [batch_size, self.num_frame_per_block], device=noise.device, dtype=torch.int64) * current_timestep
-
                 if index < len(self.denoising_step_list) - 1:
                     denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
@@ -149,6 +148,8 @@ class SdeditVideoInference(InferencePipeline):
                         torch.ones([batch_size], device="cuda",
                                    dtype=torch.long)
                     ).unflatten(0, denoised_pred.shape[:2])
+                    if block_index == 0 and force_latents is not None:
+                        denoised_pred[:, :1] = force_latents
                 else:
                     # for getting real output
                     denoised_pred = self.generator(
@@ -161,6 +162,10 @@ class SdeditVideoInference(InferencePipeline):
                         current_end=(
                             block_index + 1) * self.num_frame_per_block * self.frame_seq_length
                     )
+                    
+                    # 如果是第一个block且有force_latents，强制替换结果
+                    if block_index == 0 and force_latents is not None:
+                        denoised_pred[:, :1] = force_latents
 
             # Step 2.2: rerun with timestep zero to update the cache
             output[:, block_index * self.num_frame_per_block:(
@@ -178,11 +183,8 @@ class SdeditVideoInference(InferencePipeline):
             )
 
         # Step 3: Decode the output
-        print("[Debug] VAE解码前的output值范围:", output.min().item(), output.max().item())
         video = self.vae.decode_to_pixel(output)
-        print("[Debug] VAE解码后的video值范围:", video.min().item(), video.max().item())
         video = (video * 0.5 + 0.5).clamp(0, 1)
-        print("[Debug] 归一化后的video值范围:", video.min().item(), video.max().item())
 
         if return_latents:
             return video, output
@@ -226,30 +228,28 @@ def main():
     
     # Load reference video
     video, original_size = load_video(args.reference_video)
-    print("[Debug] 原始视频加载后的值范围:", video.min().item(), video.max().item())
     
     # Move video to CUDA and convert to [B, C, T, H, W] format
     video = video.permute(0, 3, 1, 2).unsqueeze(0).to(device="cuda", dtype=torch.bfloat16)
-    print("[Debug] 转换格式后的值范围:", video.min().item(), video.max().item())
-    
+
     # Use VAE to encode video
     with torch.no_grad():
         device, dtype = video.device, video.dtype
         video = video.permute(0, 2, 1, 3, 4)
         scale = [pipeline.vae.mean.to(device=device, dtype=dtype),
                  1.0 / pipeline.vae.std.to(device=device, dtype=dtype)]
-        print("[Debug] VAE scale值:", scale)
         latents = pipeline.vae.model.encode(video, scale).float()
-        print("[Debug] VAE编码后latents的值范围:", latents.min().item(), latents.max().item())
         latents = latents.permute(0, 2, 1, 3, 4)
 
     # Assert latent video has 12 frames
     assert latents.shape[1] == 12, f"Expected 12 frames in latent space, but got {latents.shape[1]}"
     
+    # 提取第一帧的latents并复制到12帧
+    first_frame_latents = latents[:, :1]
+    
     # Add noise using flow matching schedule
     t, denoise_steps_list = retrieve_timesteps(args.noise_level, pipeline.denoising_step_list)
     noisy_latents = add_noise(pipeline, latents, t).to(device="cuda", dtype=torch.bfloat16)
-    print("[Debug] 添加噪声后的值范围:", noisy_latents.min().item(), noisy_latents.max().item())
     
     # Create output folder
     os.makedirs(args.output_folder, exist_ok=True)
@@ -262,15 +262,13 @@ def main():
     video = pipeline.inference(
         noise=noisy_latents,
         text_prompts=prompts,
+        force_latents=first_frame_latents,
         denoise_steps_list=denoise_steps_list
     )[0]
     end_time = time.time()
-    print(f"Time taken for inference: {end_time - start_time:.2f} seconds")
-    print("[Debug] 推理后的视频值范围:", video.min().item(), video.max().item())
     
     # Convert to correct format for saving
     video = video.permute(0, 2, 3, 1).cpu().numpy()
-    print("[Debug] 转换格式后的视频值范围:", video.min(), video.max())
     
     # Resize back to original dimensions
     resized_video = []
@@ -278,7 +276,6 @@ def main():
         resized_frame = cv2.resize(frame, original_size)
         resized_video.append(resized_frame)
     video = np.stack(resized_video)
-    print("[Debug] 最终保存前的视频值范围:", video.min(), video.max())
     
     # Export video
     export_to_video(video, os.path.join(args.output_folder, "output.mp4"), fps=8)
