@@ -192,11 +192,9 @@ class InferencePipeline(torch.nn.Module):
                 current_end=(block_index + 1) *
                 self.num_frame_per_block * self.frame_seq_length
             )
-
         # Step 3: Decode the output
         video = self.vae.decode_to_pixel(output)
         video = (video * 0.5 + 0.5).clamp(0, 1)
-
         if return_latents:
             return video, output
         else:

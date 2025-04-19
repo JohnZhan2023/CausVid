@@ -32,18 +32,22 @@ pipeline.generator.load_state_dict(
 dataset = TextDataset(args.prompt_file_path)
 
 sampled_noise = torch.randn(
-    [1, 21, 16, 60, 104], device="cuda", dtype=torch.bfloat16
+    [1, 12, 16, 60, 104], device="cuda", dtype=torch.bfloat16
 )
 
 os.makedirs(args.output_folder, exist_ok=True)
+print(pipeline.denoising_step_list)
 
 for prompt_index in tqdm(range(len(dataset))):
     prompts = [dataset[prompt_index]]
-
+    import time
+    start_time = time.time()
     video = pipeline.inference(
         noise=sampled_noise,
         text_prompts=prompts
     )[0].permute(0, 2, 3, 1).cpu().numpy()
+    end_time = time.time()
+    print(f"Time taken for inference: {end_time - start_time:.2f} seconds")
 
     export_to_video(
-        video, os.path.join(args.output_folder, f"output_{prompt_index:03d}.mp4"), fps=16)
+        video, os.path.join(args.output_folder, f"output_{prompt_index:03d}.mp4"), fps=8)
